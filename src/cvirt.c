@@ -11,11 +11,11 @@
 #include <asm/uaccess.h>
 #include <linux/buffer_head.h>
 
-static struct node {
-    u32 address;
-    u32 mask; // size in bits
-    struct net_device *device;
-    struct node *next;
+struct interfaces {
+    u32 address; // адрес подсети
+    u32 mask;    // маска подсети
+    struct net_device *device; // ссылка на интерфейс
+    struct interfaces *next;   // следующий узел
 };
 
 #define ERR(...) printk(KERN_ERR "! "__VA_ARGS__)
@@ -26,13 +26,12 @@ static u32 apply_mask(u32 addr, u32 mask)
     return (addr & mask);
 }
 static char *strIP(u32 addr);
-static struct net_device *find_device_sub(struct node *subs, u32 addr)
+static struct net_device *find_device_sub(struct interfaces *subs, u32 addr)
 {
     struct net_device *device = NULL;
     while (subs && !device)
     {
         u32 res = apply_mask(subs->mask, addr);
-        LOG("Apply mask %s %s   res %s", strIP(subs->mask), strIP(addr), strIP(res));
         if (res == subs->address)
         {
             device = subs->device;
@@ -49,6 +48,7 @@ static struct net_device *find_device_sub(struct node *subs, u32 addr)
 
 static char *link = "enp0s3"; // имя родительского интерфейса
 module_param(link, charp, 0);
+
 static char *link2 = "tun0"; // имя родительского интерфейса
 module_param(link2, charp, 0);
 
@@ -61,8 +61,7 @@ static int child_ip_set = 0;
 struct priv
 {
     struct net_device_stats stats;
-    struct net_device *parent;
-    struct node *next;
+    struct interfaces *next;
 };
 
 struct arp_eth_body {
@@ -136,40 +135,43 @@ static u32 get_ip(struct sk_buff *skb)
 static rx_handler_result_t handle_frame(struct sk_buff **pskb)
 {
     struct sk_buff *skb = *pskb;
-    LOG("COME: %d", skb->protocol);
+    struct in_device *in_dev = child->ip_ptr;
+    struct in_ifaddr *ifa = in_dev->ifa_list;
+    if (!ifa)
+    {
+        return RX_HANDLER_PASS
+    }
+    u32 child_ip = ifa->ifa_address;
     if (skb->protocol == htons(ETH_P_IP))
     {
         struct iphdr *ip = ip_hdr(skb);
-        LOG("INCOME: IP4 to IP=%s", strIP(ip->daddr));
-        if (!child_ip_set || ip->daddr != child_ip) {
+        LOG("INCOME: IP to IP=%s", strIP(ip->daddr));
+        if (!ifa || ip->daddr != child_ip)
+        {
             return RX_HANDLER_PASS;
         }
-        LOG("INCOME: PASS");
     }
     else if (skb->protocol == htons(ETH_P_ARP))
     {
         struct arphdr *arp = arp_hdr(skb);
         struct arp_eth_body *body = (void *)arp + sizeof(struct arphdr);
         int i, ip = child_ip;
-        LOG("INCOME: ARP for %s", strAR_IP(body->ar_tip));
+        LOG("INCOME: ARP for IP=%s", strAR_IP(body->ar_tip));
         for (i = 0; i < sizeof(body->ar_tip); i++)
         {
             if ((ip & 0xFF) != body->ar_tip[i])
                 break;
             ip = ip >> 8;
         }
-        if (!child_ip_set || i < sizeof(body->ar_tip))
+        if (i < sizeof(body->ar_tip))
             return RX_HANDLER_PASS;
-        LOG("INCOME: PASS");
     }
-    else if (skb->protocol == htons(0xCC88)) {
-
-    }
-    else
+    else if (skb->protocol != htons(0xCC88))
     {
         return RX_HANDLER_PASS;
     }
     
+    LOG("INCOME: PASS");
     struct priv *priv = netdev_priv(child);
     priv->stats.rx_packets++;
     priv->stats.rx_bytes += skb->len;
@@ -178,8 +180,8 @@ static rx_handler_result_t handle_frame(struct sk_buff **pskb)
 }
 
 static int open( struct net_device *dev ) {
-   LOG( "%s: device opened", dev->name );
    netif_start_queue( dev );
+   LOG( "%s: device opened", dev->name );
    return 0;
 }
 
@@ -193,34 +195,22 @@ static int stop(struct net_device *dev)
 static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
     struct in_device *in_dev = child->ip_ptr;
-    struct in_ifaddr *ifa = in_dev->ifa_list;      /* IP ifaddr chain */
-    if (ifa && !child_ip_set) {
-        child_ip = ifa->ifa_address;
-        child_ip_set = 1;
-        LOG("%s: IP SET %d", child->name, ifa);
-    }
-    else if (!ifa && child_ip_set) {
-        child_ip_set = 0;
-    }
-
-    struct priv *priv = netdev_priv(dev);
-    priv->stats.tx_packets++;
-    priv->stats.tx_bytes += skb->len;
-    LOG("GET IP %d, %s", get_ip(skb), strIP(get_ip(skb)));
-    LOG("NEXT %d, ", priv->next);
-    if (priv->next)
+    struct in_ifaddr *ifa = in_dev->ifa_list;
+    if (ifa) 
     {
-        LOG("NEXT NET %s, MASK %s %d %d", strIP(priv->next->address), strIP(priv->next->mask), priv->next->device, priv->next->next);
-    }
-    struct net_device *device = find_device_sub(priv->next, get_ip(skb));
-    if (device)
-    {
-        skb->dev = device;
-        skb->priority = 1;
-        dev_queue_xmit(skb);
-        LOG("OUT: %d", skb->protocol);
-        LOG("OUTPUT: injecting frame from %s to %s", dev->name, skb->dev->name);
-        return NETDEV_TX_OK;
+        struct priv *priv = netdev_priv(dev);
+        priv->stats.tx_packets++;
+        priv->stats.tx_bytes += skb->len;
+        LOG("GET IP %d, %s", get_ip(skb), strIP(get_ip(skb)));
+        struct net_device *device = find_device_sub(priv->next, get_ip(skb));
+        if (device)
+        {
+            skb->dev = device;
+            skb->priority = 1;
+            dev_queue_xmit(skb);
+            LOG("OUTPUT: injecting frame from %s to %s. Tarhet IP: %s", dev->name, skb->dev->name, strIP(get_ip(skb)));
+            return NETDEV_TX_OK;
+        }
     }
     return NETDEV_TX_OK;
 }
@@ -243,8 +233,10 @@ static void setup(struct net_device *dev)
     ether_setup(dev);
     memset(netdev_priv(dev), 0, sizeof(struct priv));
     dev->netdev_ops = &crypto_net_device_ops;
-    for (j = 0; j < ETH_ALEN; ++j) // fill in the MAC address with a phoney
+    for (j = 0; j < ETH_ALEN; ++j) // Заполнить MAC адрес
+    {
         dev->dev_addr[j] = (char)j;
+    }
 }
 
 int __init init(void)
@@ -254,11 +246,7 @@ int __init init(void)
     char ifstr[40];
     sprintf(ifstr, "%s%s", ifname, "%d");
 
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0))
-    child = alloc_netdev(sizeof(struct priv), ifstr, setup);
-#else
     child = alloc_netdev(sizeof(struct priv), ifstr, NET_NAME_UNKNOWN, setup);
-#endif
     if (child == NULL)
     {
         ERR("%s: allocate error", THIS_MODULE->name);
@@ -270,23 +258,25 @@ int __init init(void)
     {
         ERR("%s: no such net: %s", THIS_MODULE->name, link);
         err = -ENODEV;
-        goto err;
+        free_netdev(child);
+        return err;
     }
 
     if (priv->parent->type != ARPHRD_ETHER && priv->parent->type != ARPHRD_LOOPBACK)
     {
         ERR("%s: illegal net type", THIS_MODULE->name);
         err = -EINVAL;
-        goto err;
+        free_netdev(child);
+        return err;
     }
 
-    struct node *second = kmalloc(sizeof(struct node), GFP_KERNEL);
+    struct interfaces *second = kmalloc(sizeof(struct interfaces), GFP_KERNEL);
     second->address = charToIP(0, 0, (char)0, (char)0);
     second->mask = charToIP(0, 0, (char)0, (char)0);
     second->device = priv->parent;
     second->next = NULL;
 
-    struct node *first = kmalloc(sizeof(struct node), GFP_KERNEL);
+    struct interfaces *first = kmalloc(sizeof(struct interfaces), GFP_KERNEL);
     first->address = charToIP(192, 168, (char)1, (char)0);
     first->mask = charToIP(255, 255, (char)255, (char)0);
     first->device = priv->parent;
@@ -308,7 +298,8 @@ int __init init(void)
     {
         ERR("%s: allocate name, error %i", THIS_MODULE->name, err);
         err = -EIO;
-        goto err;
+        free_netdev(child);
+        return err;
     }
     register_netdev(child);
     rtnl_lock();
@@ -318,9 +309,6 @@ int __init init(void)
     LOG("%s: create link %s", THIS_MODULE->name, child->name);
     LOG("%s: registered rx handler for %s", THIS_MODULE->name, priv->parent->name);
     return 0;
-err:
-    free_netdev(child);
-    return err;
 }
 
 void __exit exit(void)
