@@ -13,7 +13,7 @@
 
 static struct node {
     u32 address;
-    u32 mask; // size in bits
+    u32 mask;
     struct net_device *device;
     struct node *next;
 };
