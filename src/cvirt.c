@@ -1,16 +1,15 @@
 #include <linux/module.h>
-#include <linux/version.h>
-#include <linux/netdevice.h>
-#include <linux/etherdevice.h>
 #include <linux/moduleparam.h>
-#include <linux/inetdevice.h>
-#include <net/arp.h>
+#include <linux/inetdevice.h> //if_addr
 #include <net/ip.h>
-#include <linux/fs.h>
-#include <asm/segment.h>
-#include <asm/uaccess.h>
-#include <linux/buffer_head.h>
 
+static char *link = "enp0s3"; // имя родительского интерфейса
+module_param(link, charp, 0);
+
+static char *ifname = "virt"; // имя создаваемого интерфейса
+module_param(ifname, charp, 0);
+
+static struct net_device *child = NULL;
 struct interfaces {
     u32 address; // адрес подсети
     u32 mask;    // маска подсети
@@ -18,46 +17,6 @@ struct interfaces {
     struct interfaces *next;   // следующий узел
 };
 
-#define ERR(...) printk(KERN_ERR "! "__VA_ARGS__)
-#define LOG(...) printk(KERN_INFO "! "__VA_ARGS__)
-
-static u32 apply_mask(u32 addr, u32 mask)
-{
-    return (addr & mask);
-}
-static char *strIP(u32 addr);
-static struct net_device *find_device_sub(struct interfaces *subs, u32 addr)
-{
-    struct net_device *device = NULL;
-    while (subs && !device)
-    {
-        u32 res = apply_mask(subs->mask, addr);
-        if (res == subs->address)
-        {
-            device = subs->device;
-        }
-        else
-        {
-            subs = subs->next;
-        }
-    }
-
-    return device;
-}
-
-
-static char *link = "enp0s3"; // имя родительского интерфейса
-module_param(link, charp, 0);
-
-static char *link2 = "tun0"; // имя родительского интерфейса
-module_param(link2, charp, 0);
-
-static char *ifname = "virt"; // имя создаваемого интерфейса
-module_param(ifname, charp, 0);
-
-static struct net_device *child = NULL;
-static u32 child_ip = 0;
-static int child_ip_set = 0;
 struct priv
 {
     struct net_device_stats stats;
@@ -71,8 +30,44 @@ struct arp_eth_body {
    unsigned char  ar_tip[ 4 ];            // target IP address            
 };
 
+#define ERR(...) printk(KERN_ERR "! "__VA_ARGS__)
+#define LOG(...) printk(KERN_INFO "! "__VA_ARGS__)
+
+static u32 apply_mask(u32 addr, u32 mask)
+{
+    return (addr & mask);
+}
+static char *strIP(u32 addr);
+static struct net_device *find_device_sub(struct interfaces *subs, u32 addr)
+{
+    struct net_device *device = NULL;
+    int i = -1;
+    while (subs && !device)
+    {
+        i += 1;
+        u32 res = apply_mask(subs->mask, addr);
+        if (res == subs->address)
+        {
+            device = subs->device;
+        }
+        else
+        {
+            subs = subs->next;
+        }
+    }
+
+    if (i >= 0)
+    {
+        LOG("Device number %d choosed", i);
+    }
+
+    return device;
+}
+
+
+
 static char *strIP(u32 addr)
-{ // диагностика IP в точечной нотации
+{ // диагностика IP в точечной нотации  
     static char saddr[MAX_ADDR_LEN];
     sprintf(saddr, "%d.%d.%d.%d",
             (addr)&0xFF, (addr >> 8) & 0xFF,
@@ -139,7 +134,7 @@ static rx_handler_result_t handle_frame(struct sk_buff **pskb)
     struct in_ifaddr *ifa = in_dev->ifa_list;
     if (!ifa)
     {
-        return RX_HANDLER_PASS
+        return RX_HANDLER_PASS;
     }
     u32 child_ip = ifa->ifa_address;
     if (skb->protocol == htons(ETH_P_IP))
@@ -208,7 +203,7 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
             skb->dev = device;
             skb->priority = 1;
             dev_queue_xmit(skb);
-            LOG("OUTPUT: injecting frame from %s to %s. Tarhet IP: %s", dev->name, skb->dev->name, strIP(get_ip(skb)));
+            LOG("OUTPUT: injecting frame from %s to %s. Target IP: %s", dev->name, skb->dev->name, strIP(get_ip(skb)));
             return NETDEV_TX_OK;
         }
     }
@@ -253,16 +248,14 @@ int __init init(void)
         return -ENOMEM;
     }
     priv = netdev_priv(child);
-    priv->parent = __dev_get_by_name(&init_net, link); // parent interface
-    if (!priv->parent)
+    struct net_device *device = __dev_get_by_name(&init_net, link); // parent interface
+    if (!device)
     {
         ERR("%s: no such net: %s", THIS_MODULE->name, link);
         err = -ENODEV;
         free_netdev(child);
         return err;
-    }
-
-    if (priv->parent->type != ARPHRD_ETHER && priv->parent->type != ARPHRD_LOOPBACK)
+    } else if (device->type != ARPHRD_ETHER && device->type != ARPHRD_LOOPBACK)
     {
         ERR("%s: illegal net type", THIS_MODULE->name);
         err = -EINVAL;
@@ -273,27 +266,18 @@ int __init init(void)
     struct interfaces *second = kmalloc(sizeof(struct interfaces), GFP_KERNEL);
     second->address = charToIP(0, 0, (char)0, (char)0);
     second->mask = charToIP(0, 0, (char)0, (char)0);
-    second->device = priv->parent;
+    second->device = device;
     second->next = NULL;
 
     struct interfaces *first = kmalloc(sizeof(struct interfaces), GFP_KERNEL);
     first->address = charToIP(192, 168, (char)1, (char)0);
     first->mask = charToIP(255, 255, (char)255, (char)0);
-    first->device = priv->parent;
+    first->device = device;
     first->next = second;
 
-    LOG("firts rec %d %s", charToIP(192, 168, (char)1, (char)0), strIP(charToIP(192, 168, 1, 0)));
-
     priv->next = first;
-
-    /* also, and clone its IP, MAC and other information */
-    LOG("%d: dev", priv->parent);
-    struct in_device *in_dev = priv->parent->ip_ptr;
-    LOG("%d: parent dev", in_dev);
-    struct in_ifaddr *ifa = in_dev->ifa_list;      /* IP ifaddr chain */
-    LOG("%d: parent dev", ifa);
-    memcpy(child->dev_addr, priv->parent->dev_addr, ETH_ALEN);
-    memcpy(child->broadcast, priv->parent->broadcast, ETH_ALEN);
+    memcpy(child->dev_addr, device->dev_addr, ETH_ALEN);
+    memcpy(child->broadcast, device->broadcast, ETH_ALEN);
     if ((err = dev_alloc_name(child, child->name)))
     {
         ERR("%s: allocate name, error %i", THIS_MODULE->name, err);
@@ -303,23 +287,25 @@ int __init init(void)
     }
     register_netdev(child);
     rtnl_lock();
-    netdev_rx_handler_register(priv->parent, &handle_frame, NULL);
+    netdev_rx_handler_register(device, &handle_frame, NULL);
     rtnl_unlock();
     LOG("module %s loaded", THIS_MODULE->name);
     LOG("%s: create link %s", THIS_MODULE->name, child->name);
-    LOG("%s: registered rx handler for %s", THIS_MODULE->name, priv->parent->name);
+    LOG("%s: registered rx handler for %s", THIS_MODULE->name, priv->next->device->name);
     return 0;
 }
 
 void __exit exit(void)
 {
     struct priv *priv = netdev_priv(child);
-    if (priv->parent)
+    struct interfaces *next = priv->next;
+    while (next)
     {
         rtnl_lock();
-        netdev_rx_handler_unregister(priv->parent);
+        netdev_rx_handler_unregister(next->device);
         rtnl_unlock();
-        LOG("unregister rx handler for %s\n", priv->parent->name);
+        LOG("unregister rx handler for %s\n", next->device->name);
+        next = next->next;
     }
     unregister_netdev(child);
     free_netdev(child);
